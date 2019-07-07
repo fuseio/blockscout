@@ -1,4 +1,4 @@
-FROM bitwalker/alpine-elixir-phoenix
+FROM bitwalker/alpine-elixir-phoenix:1.8.1
 
 RUN apk --no-cache --update add alpine-sdk gmp-dev automake libtool inotify-tools autoconf python
 
@@ -15,15 +15,12 @@ ADD apps/explorer/mix.exs ./apps/explorer/
 ADD apps/ethereum_jsonrpc/mix.exs ./apps/ethereum_jsonrpc/
 ADD apps/indexer/mix.exs ./apps/indexer/
 
-RUN mix do deps.get, deps.compile
+RUN mix do deps.get, local.rebar --force, deps.compile, compile
 
 ADD . .
 
 ARG COIN
 RUN if [ "$COIN" != "" ]; then sed -i s/"POA"/"${COIN}"/g apps/block_scout_web/priv/gettext/en/LC_MESSAGES/default.po; fi
-
-# Run forderground build and phoenix digest
-RUN mix compile
 
 # Add blockscout npm deps
 RUN cd apps/block_scout_web/assets/ && \
