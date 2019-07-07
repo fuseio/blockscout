@@ -61,10 +61,15 @@ migrate: build
 
 start: build
 	@echo "==> Starting blockscout"
-	@docker run --rm --name $(BS_CONTAINER_NAME) \
+	@docker run \
+					--detach \
+					--rm \
+					--name $(BS_CONTAINER_NAME) \
 					$(BLOCKSCOUT_CONTAINNER_PARAMS) \
 					-p 4000:4000 \
-					$(DOCKER_IMAGE) /bin/sh -c "mix phx.server"
+					--restart=on-failure \
+					$(DOCKER_IMAGE) \
+					/bin/sh -c "mix phx.server"
 
 run: start
 
