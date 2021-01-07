@@ -1,6 +1,6 @@
 import $ from 'jquery'
 import { getCurrentCycleBlocks, getCycleEnd } from './smart_contract/consensus'
-import { secondsToDhms, calcCycleLength } from './utils'
+import { secondsToDhms, calcCycleLength } from './fuse_utils'
 
 function appendTime (time) {
   $('[data-selector="cycle-end"]').empty().append(secondsToDhms(time))

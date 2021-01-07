@@ -387,10 +387,12 @@ defmodule Explorer.ChainTest do
     test "without transactions" do
       %Address{hash: address_hash} = insert(:address)
 
-      assert Repo.aggregate(Transaction, :count, :hash) == 0
+      start_supervised!(AddressesCounter)
+      AddressesCounter.consolidate()
 
       assert [] == Chain.address_to_mined_transactions_with_rewards(address_hash)
     end
+  end
 
     test "with from transactions" do
       %Address{hash: address_hash} = address = insert(:address)
@@ -431,6 +433,7 @@ defmodule Explorer.ChainTest do
                Chain.address_to_mined_transactions_with_rewards(address_hash, direction: :from)
                |> Repo.preload([:block, :to_address, :from_address])
     end
+  end
 
     test "with to and from transactions and direction: :to" do
       %Address{hash: address_hash} = address = insert(:address)
@@ -464,15 +467,20 @@ defmodule Explorer.ChainTest do
                |> Repo.preload([:block, :to_address, :from_address])
     end
 
-    test "does not include non-contract-creation parent transactions" do
+    test "paginates logs" do
+      %Address{hash: address_hash} = address = insert(:address)
+
       transaction =
-        %Transaction{} =
         :transaction
-        |> insert()
+        |> insert(to_address: address)
         |> with_block()
 
-      %InternalTransaction{created_contract_address: address} =
-        insert(:internal_transaction_create,
+      log1 = insert(:log, transaction: transaction, index: 1, address: address, block_number: transaction.block_number)
+
+      2..51
+      |> Enum.map(fn index ->
+        insert(:log,
+          block: transaction.block,
           transaction: transaction,
           index: 0,
           block_number: transaction.block_number,
@@ -480,6 +488,12 @@ defmodule Explorer.ChainTest do
           block_index: 0,
           transaction_index: transaction.index
         )
+      end)
+      |> Enum.map(& &1.index)
+
+      paging_options1 = %PagingOptions{page_size: 1}
+
+      [_log] = Chain.address_to_logs(address_hash, paging_options: paging_options1)
 
       assert [] == Chain.address_to_mined_transactions_with_rewards(address.hash)
     end
@@ -487,15 +501,17 @@ defmodule Explorer.ChainTest do
     test "returns transactions that have token transfers for the given to_address" do
       %Address{hash: address_hash} = address = insert(:address)
 
-      transaction =
+      transaction1 =
         :transaction
-        |> insert(to_address: address, to_address_hash: address.hash)
+        |> insert(to_address: address)
         |> with_block()
 
-      insert(
-        :token_transfer,
-        to_address: address,
-        transaction: transaction
+      insert(:log,
+        block: transaction1.block,
+        transaction: transaction1,
+        index: 1,
+        address: address,
+        block_number: transaction1.block_number
       )
 
       assert [transaction.hash] ==
@@ -634,6 +650,68 @@ defmodule Explorer.ChainTest do
     end
 
     test "with emission rewards and transactions" do
+      Application.put_env(:block_scout_web, BlockScoutWeb.Chain, has_emission_funds: true)
+
+      Application.put_env(:explorer, Explorer.Chain.Block.Reward,
+        validators_contract_address: "0x0000000000000000000000000000000000000005",
+        keys_manager_contract_address: "0x0000000000000000000000000000000000000006"
+      )
+
+      block = insert(:block)
+
+      block_miner_hash_string = Base.encode16(block.miner_hash.bytes, case: :lower)
+
+      insert(
+        :reward,
+        address_hash: block.miner_hash,
+        block_hash: block.hash,
+        address_type: :validator
+      )
+
+      insert(
+        :reward,
+        address_hash: block.miner_hash,
+        block_hash: block.hash,
+        address_type: :emission_funds
+      )
+
+      :transaction
+      |> insert(to_address: block.miner)
+      |> with_block(block)
+      |> Repo.preload(:token_transfers)
+
+      # isValidator => true
+      expect(
+        EthereumJSONRPC.Mox,
+        :json_rpc,
+        fn [%{id: id, method: _, params: [%{data: _, to: _}, _]}], _options ->
+          {:ok,
+           [%{id: id, jsonrpc: "2.0", result: "0x0000000000000000000000000000000000000000000000000000000000000001"}]}
+        end
+      )
+
+      # getPayoutByMining => 0x0000000000000000000000000000000000000001
+      expect(
+        EthereumJSONRPC.Mox,
+        :json_rpc,
+        fn [%{id: id, method: _, params: [%{data: _, to: _}, _]}], _options ->
+          {:ok, [%{id: id, result: "0x000000000000000000000000" <> block_miner_hash_string}]}
+        end
+      )
+
+      assert [_, {_, _}] = Chain.address_to_mined_transactions_with_rewards(block.miner.hash, direction: :to)
+
+      on_exit(fn ->
+        Application.put_env(:block_scout_web, BlockScoutWeb.Chain, has_emission_funds: false)
+
+        Application.put_env(:explorer, Explorer.Chain.Block.Reward,
+          validators_contract_address: nil,
+          keys_manager_contract_address: nil
+        )
+      end)
+    end
+
+    test "with transactions if rewards are not in the range of blocks" do
       Application.put_env(:block_scout_web, BlockScoutWeb.Chain, has_emission_funds: true)
 
       Application.put_env(:explorer, Explorer.Chain.Block.Reward,
@@ -1372,16 +1450,19 @@ defmodule Explorer.ChainTest do
     test "returns 1.0 if fully indexed blocks" do
       for index <- 0..9 do
         insert(:block, number: index)
+        Process.sleep(200)
       end
 
-      assert Decimal.cmp(Chain.indexed_ratio(), 1) == :eq
-    end
-  end
+      transaction =
+        address_hash
+        |> Chain.address_hash_to_token_transfers()
+        |> List.first()
 
   describe "fetch_min_block_number/0" do
     test "fetches min block numbers" do
       for index <- 5..9 do
         insert(:block, number: index)
+        Process.sleep(200)
       end
 
       assert 5 = Chain.fetch_min_block_number()
@@ -3372,14 +3453,20 @@ defmodule Explorer.ChainTest do
 
     # 0101
     test "0..0 with blocks 1,3" do
-      Enum.each([1, 3], &insert(:block, number: &1))
+      Enum.each([1, 3], fn num ->
+        insert(:block, number: num)
+        Process.sleep(200)
+      end)
 
       assert Chain.missing_block_number_ranges(0..0) == [0..0]
     end
 
     # 0111
     test "0..0 with blocks 1..3" do
-      Enum.each(1..3, &insert(:block, number: &1))
+      Enum.each(1..3, fn num ->
+        insert(:block, number: num)
+        Process.sleep(200)
+      end)
 
       assert Chain.missing_block_number_ranges(0..0) == [0..0]
     end
@@ -3421,7 +3508,10 @@ defmodule Explorer.ChainTest do
 
     # 1101
     test "0..0 with blocks 0,1,3" do
-      Enum.each([0, 1, 3], &insert(:block, number: &1))
+      Enum.each([0, 1, 3], fn num ->
+        insert(:block, number: num)
+        Process.sleep(200)
+      end)
 
       assert Chain.missing_block_number_ranges(0..0) == []
     end
@@ -3435,7 +3525,10 @@ defmodule Explorer.ChainTest do
 
     # 1111
     test "0..0 with blocks 0..3" do
-      Enum.each(0..2, &insert(:block, number: &1))
+      Enum.each(0..2, fn num ->
+        insert(:block, number: num)
+        Process.sleep(200)
+      end)
 
       assert Chain.missing_block_number_ranges(0..0) == []
     end
@@ -4349,7 +4442,6 @@ defmodule Explorer.ChainTest do
 
       assert {:ok, []} = Chain.stream_unfetched_token_instances([], &[&1 | &2])
     end
-  end
 
   describe "search_token/1" do
     test "finds by part of the name" do
@@ -4658,7 +4750,7 @@ defmodule Explorer.ChainTest do
           transaction: transaction,
           token_contract_address: token_contract_address,
           token: token,
-          token_id: 11
+          token_id: 29
         )
 
       second_page =
@@ -4669,7 +4761,7 @@ defmodule Explorer.ChainTest do
           transaction: transaction,
           token_contract_address: token_contract_address,
           token: token,
-          token_id: 29
+          token_id: 11
         )
 
       paging_options = %PagingOptions{key: {first_page.token_id}, page_size: 1}
@@ -4858,6 +4950,72 @@ defmodule Explorer.ChainTest do
 
       assert found_creation_data == ""
     end
+
+    test "fetches contract creation input data from contract byte code (if contract is pre-compiled)" do
+      input = %Data{
+        bytes: <<1, 2, 3, 4, 5>>
+      }
+
+      address =
+        insert(:address,
+          contract_code: %Data{
+            bytes: <<1, 2, 3, 4, 5>>
+          }
+        )
+
+      found_creation_data = Chain.contract_creation_input_data(address.hash)
+
+      assert found_creation_data == Data.to_string(input) |> String.replace("0x", "")
+    end
+  end
+
+  describe "transaction_token_transfer_type/1" do
+    test "detects erc721 token transfer" do
+      from_address_hash = "0x7a30272c902563b712245696f0a81c5a0e45ddc8"
+      to_address_hash = "0xb544cead8b660aae9f2e37450f7be2ffbc501793"
+      from_address = insert(:address, hash: from_address_hash)
+      to_address = insert(:address, hash: to_address_hash)
+      block = insert(:block)
+
+      transaction =
+        insert(:transaction,
+          input:
+            "0x23b872dd0000000000000000000000007a30272c902563b712245696f0a81c5a0e45ddc8000000000000000000000000b544cead8b660aae9f2e37450f7be2ffbc5017930000000000000000000000000000000000000000000000000000000000000002",
+          value: Decimal.new(0),
+          created_contract_address_hash: nil
+        )
+        |> with_block(block, status: :ok)
+
+      insert(:token_transfer, from_address: from_address, to_address: to_address, transaction: transaction)
+
+      assert :erc721 = Chain.transaction_token_transfer_type(Repo.preload(transaction, token_transfers: :token))
+    end
+
+    test "detects erc20 token transfer" do
+      from_address_hash = "0x5881fdfE964bE26aC6C8e5153C4ad1c83181C024"
+      to_address_hash = "0xE113127804Ae2383f63Fe8cE31B212D5CB85113d"
+      from_address = insert(:address, hash: from_address_hash)
+      to_address = insert(:address, hash: to_address_hash)
+      block = insert(:block)
+
+      transaction =
+        insert(:transaction,
+          input:
+            "0xa9059cbb000000000000000000000000e113127804ae2383f63fe8ce31b212d5cb85113d0000000000000000000000000000000000000000000001b3093f45ba4dc40000",
+          value: Decimal.new(0),
+          created_contract_address_hash: nil
+        )
+        |> with_block(block, status: :ok)
+
+      insert(:token_transfer,
+        from_address: from_address,
+        to_address: to_address,
+        transaction: transaction,
+        amount: 8_025_000_000_000_000_000_000
+      )
+
+      assert :erc20 = Chain.transaction_token_transfer_type(Repo.preload(transaction, token_transfers: :token))
+    end
   end
 
   describe "transaction_token_transfer_type/1" do
@@ -4980,7 +5138,7 @@ defmodule Explorer.ChainTest do
 
       options = %PagingOptions{page_size: 20, page_number: 1}
 
-      assert [gotten_validator] = Chain.staking_pools(:validator, options)
+      assert [%{pool: gotten_validator}] = Chain.staking_pools(:validator, options)
       assert inserted_validator.staking_address_hash == gotten_validator.staking_address_hash
     end
 
@@ -4990,8 +5148,27 @@ defmodule Explorer.ChainTest do
 
       options = %PagingOptions{page_size: 20, page_number: 1}
 
-      assert [gotten_pool] = Chain.staking_pools(:active, options)
+      assert [%{pool: gotten_pool}] = Chain.staking_pools(:active, options)
       assert inserted_pool.staking_address_hash == gotten_pool.staking_address_hash
+    end
+
+    test "all active staking pools ordered by staking_address" do
+      address1 = Factory.address_hash()
+      address2 = Factory.address_hash()
+      address3 = Factory.address_hash()
+
+      assert address1 < address2 and address2 < address3
+
+      # insert pools in descending order
+      insert(:staking_pool, is_active: true, staking_address_hash: address3)
+      insert(:staking_pool, is_active: true, staking_address_hash: address2)
+      insert(:staking_pool, is_active: true, staking_address_hash: address1)
+
+      # get all active pools in ascending order
+      assert [%{pool: pool1}, %{pool: pool2}, %{pool: pool3}] = Chain.staking_pools(:active, :all)
+      assert pool1.staking_address_hash == address1
+      assert pool2.staking_address_hash == address2
+      assert pool3.staking_address_hash == address3
     end
 
     test "inactive staking pools" do
@@ -5000,7 +5177,7 @@ defmodule Explorer.ChainTest do
 
       options = %PagingOptions{page_size: 20, page_number: 1}
 
-      assert [gotten_pool] = Chain.staking_pools(:inactive, options)
+      assert [%{pool: gotten_pool}] = Chain.staking_pools(:inactive, options)
       assert inserted_pool.staking_address_hash == gotten_pool.staking_address_hash
     end
   end

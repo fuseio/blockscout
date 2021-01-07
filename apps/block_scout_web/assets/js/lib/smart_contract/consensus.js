@@ -12,19 +12,19 @@ async function currentBlockNumber () {
 }
 
 async function currentCycleStartBlock() {
-  return await consensus.methods.getCurrentCycleStartBlock.call()
+  return await consensus.methods.getCurrentCycleStartBlock().call()
 }
 
 async function decimals () {
-  return await consensus.methods.DECIMALS.call()
+  return await consensus.methods.DECIMALS().call()
 }
 
-async function currentCycleEndBlock () {
-  return await consensus.methods.getCurrentCycleEndBlock.call()
+async function currentCycleEndBlock() {
+  return await consensus.methods.getCurrentCycleEndBlock().call()
 }
 
 export async function getActiveValidators () {
-  const validators = await consensus.methods.getValidators.call()
+  const validators = await consensus.methods.getValidators().call()
   return validators && validators.length
 }
 
